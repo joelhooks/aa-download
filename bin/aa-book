@@ -119,23 +119,26 @@ download_book() {
     fi
     
     local download_url=""
-    local server=0
-    
-    # Try different servers on failure
+    local last_server_file="${CONFIG_DIR}/last_working_server.txt"
+    local server=$(cat "$last_server_file" 2>/dev/null || echo 6)  # Use last working or default to 6
+
+    # Try different servers on failure, working backwards
     for attempt in $(seq 1 $max_retries); do
         status "Attempt $attempt: Getting download URL (server $server)..."
-        
+
         download_url=$(curl -s -I -b "$COOKIE_FILE" --connect-timeout 10 --max-time 30 \
             "${BASE_URL}/fast_download/${md5}/0/${server}" 2>/dev/null | \
             grep -i '^location:' | sed 's/location: //i' | tr -d '\r\n')
-        
+
         if [[ -n "$download_url" && "$download_url" != *"not_member"* ]]; then
+            # Remember this server for next time
+            echo "$server" > "$last_server_file"
             break
         fi
-        
+
         warn "Server $server failed, trying next..."
-        server=$((server + 1))
-        [[ $server -gt 5 ]] && server=0
+        server=$((server - 1))
+        [[ $server -lt 0 ]] && server=6  # Wrap back to 6
         sleep 2
     done
     
@@ -265,7 +268,7 @@ add_book() {
     if [[ "$background" == "--background" || "$background" == "-b" ]]; then
         nohup bash -c "
             export PATH=\"\$HOME/.local/bin:\$PATH\"
-            source ~/.clawdbot/skills/annas-archive/aa-book.sh
+            source ~/Code/joelhooks/aa-download/bin/aa-book
             _run_pipeline '$md5' '$reason'
         " >> "$PROGRESS_LOG" 2>&1 &
         local pid=$!
