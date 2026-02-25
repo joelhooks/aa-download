@@ -1,17 +1,20 @@
 #!/bin/bash
-# aa-book: Full Anna's Archive → pdf-brain pipeline
+# aa-book: Anna's Archive → NAS book pipeline
 # Usage: aa-book <command> [args...]
+# Requires: agent-secrets (annas_archive_key), agent-browser, curl, python3
 
 set -e
 
 COOKIE_FILE="${HOME}/.config/annas-archive/cookies.txt"
-SECRET_FILE="${HOME}/.config/annas-archive/secret.txt"
+SESSION_FILE="${HOME}/.config/annas-archive/aa-session.json"
 CONFIG_DIR="${HOME}/.config/annas-archive"
-BASE_URL="https://annas-archive.pm"
-INCOMING_DIR="${HOME}/clawd/data/pdf-brain/incoming"
+BASE_URL="https://annas-archive.li"
+LOCAL_STAGING="/tmp/aa-book"
+NAS_HOST="joel@three-body"
+NAS_BOOKS_DIR="/volume1/home/joel/books"
 PROGRESS_LOG="/tmp/aa-book-progress.log"
 
-mkdir -p "$CONFIG_DIR" "$INCOMING_DIR"
+mkdir -p "$CONFIG_DIR" "$LOCAL_STAGING"
 
 # Colors
 RED='\033[0;31m'
@@ -25,146 +28,185 @@ warn() { echo -e "${YELLOW}[$(date +%H:%M:%S)]${NC} $1" | tee -a "$PROGRESS_LOG"
 error() { echo -e "${RED}[$(date +%H:%M:%S)]${NC} $1" | tee -a "$PROGRESS_LOG"; }
 status() { echo -e "${CYAN}[STATUS]${NC} $1" | tee -a "$PROGRESS_LOG"; }
 
-check_login() {
-    [[ -f "$COOKIE_FILE" ]] && curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_FILE" "${BASE_URL}/account/" | grep -q "200"
+# --- Auth ---
+# Browser-based login (required for fast downloads)
+browser_login() {
+    local secret
+    if command -v secrets &> /dev/null; then
+        secret=$(secrets lease annas_archive_key --ttl 15m --raw 2>/dev/null)
+    fi
+    [[ -z "$secret" ]] && { error "Failed to lease annas_archive_key from agent-secrets"; return 1; }
+
+    log "Logging in via browser..."
+    agent-browser open "${BASE_URL}/account/" 2>/dev/null
+    agent-browser wait --load networkidle 2>/dev/null
+
+    # Fill secret key and submit. Support both legacy "@e123" and current "ref=e123" snapshot formats.
+    local snapshot
+    snapshot="$(agent-browser snapshot -i 2>/dev/null || true)"
+    echo "$snapshot" | grep -q 'Secret key' || { error "Login page not found"; return 1; }
+
+    local key_ref
+    key_ref="$(echo "$snapshot" | grep 'Secret key' | grep -m1 -oE 'ref=e[0-9]+' | cut -d= -f2)"
+    if [[ -z "$key_ref" ]]; then
+        key_ref="$(echo "$snapshot" | grep 'Secret key' | grep -m1 -oE '@e[0-9]+' | sed 's/@//')"
+    fi
+
+    local btn_ref
+    btn_ref="$(echo "$snapshot" | grep 'button \"Log in\"' | grep -m1 -oE 'ref=e[0-9]+' | cut -d= -f2)"
+    if [[ -z "$btn_ref" ]]; then
+        btn_ref="$(echo "$snapshot" | grep 'button \"Log in\"' | grep -m1 -oE '@e[0-9]+' | sed 's/@//')"
+    fi
+
+    [[ -z "$key_ref" || -z "$btn_ref" ]] && { error "Could not resolve login form references"; return 1; }
+
+    agent-browser fill "$key_ref" "$secret" 2>/dev/null
+    agent-browser click "$btn_ref" 2>/dev/null
+    agent-browser wait --load networkidle 2>/dev/null
+
+    # Save session for reuse
+    agent-browser state save "$SESSION_FILE" 2>/dev/null
+    log "Login successful, session saved"
 }
 
-do_login() {
-    [[ ! -f "$SECRET_FILE" ]] && { error "No secret key at $SECRET_FILE"; exit 1; }
-    log "Logging in..."
+# Restore browser session or login fresh
+ensure_browser_auth() {
+    if [[ -f "$SESSION_FILE" ]]; then
+        # state load fails when a browser is already running
+        agent-browser close >/dev/null 2>&1 || true
+        if agent-browser state load "$SESSION_FILE" 2>/dev/null; then
+            # Verify still logged in
+            agent-browser open "${BASE_URL}/account/" 2>/dev/null || true
+            agent-browser wait --load networkidle 2>/dev/null || true
+            local logged_in
+            logged_in=$(agent-browser eval 'document.documentElement.classList.contains("aa-logged-in")' 2>/dev/null | tr -d '"' || true)
+            if [[ "$logged_in" == "true" ]]; then
+                log "Browser session restored"
+                return 0
+            fi
+        fi
+    fi
+    browser_login
+}
+
+# curl-based login (for search only)
+curl_login() {
+    local secret
+    if command -v secrets &> /dev/null; then
+        secret=$(secrets lease annas_archive_key --ttl 15m --raw 2>/dev/null)
+    fi
+    [[ -z "$secret" ]] && { error "Failed to lease annas_archive_key from agent-secrets"; return 1; }
+    log "Logging in via curl..."
     curl -s -c "$COOKIE_FILE" -b "$COOKIE_FILE" -L -X POST \
-        -d "key=$(cat "$SECRET_FILE")" "${BASE_URL}/account/" > /dev/null
-    check_login || { error "Login failed"; exit 1; }
+        -d "key=${secret}" "${BASE_URL}/account/" > /dev/null
     log "Login successful"
 }
 
+check_curl_login() {
+    [[ -f "$COOKIE_FILE" ]] && curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_FILE" "${BASE_URL}/account/" | grep -q "200"
+}
+
+# --- Search ---
 search_books() {
     local query="$1"
-    local format_filter="${2:-}"  # Optional: pdf, epub, mobi
+    local format_filter="${2:-}"
 
     log "Searching: $query"
     [[ -n "$format_filter" ]] && log "Format filter: $format_filter"
 
-    # Fetch search page
     local html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/search?q=$(echo "$query" | sed 's/ /+/g')")
 
-    # Extract results with format, size, title
-    # Pattern: /md5/HASH with nearby format and size info
     echo "$html" | python3 -c "
-import sys
-import re
+import sys, re
 from html import unescape
 
 html = sys.stdin.read()
 format_filter = '$format_filter'.lower()
 
-# Find all book entries - look for md5 links with context
 pattern = r'href=\"/md5/([a-f0-9]{32})\"[^>]*>([^<]+)</a>.*?(\d+(?:\.\d+)?\s*[KMG]?B).*?(pdf|epub|mobi|djvu|azw3)'
 matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
 
 seen = set()
 results = []
 for md5, title, size, fmt in matches:
-    if md5 in seen:
-        continue
+    if md5 in seen: continue
     seen.add(md5)
-
     title = unescape(title.strip())[:60]
     fmt = fmt.lower()
+    if format_filter and fmt != format_filter: continue
+    color = '\033[32m' if fmt == 'pdf' else '\033[33m'
+    results.append((md5, title, size, fmt, f'{color}{fmt}\033[0m'))
 
-    # Apply format filter
-    if format_filter and fmt != format_filter:
-        continue
-
-    # Color code: green for PDF (no conversion), yellow for others
-    if fmt == 'pdf':
-        fmt_display = f'\033[32m{fmt}\033[0m'
-    else:
-        fmt_display = f'\033[33m{fmt}\033[0m'
-
-    results.append((md5, title, size, fmt, fmt_display))
-
-# Sort: PDFs first, then by format
 results.sort(key=lambda x: (0 if x[3] == 'pdf' else 1, x[3]))
-
-for md5, title, size, fmt, fmt_display in results[:15]:
-    print(f'{md5}  {fmt_display:12} {size:>8}  {title}')
+for md5, title, size, fmt, disp in results[:15]:
+    print(f'{md5}  {disp:12} {size:>8}  {title}')
 " 2>/dev/null || {
-        # Fallback to simple extraction if python parsing fails
         echo "$html" | grep -oP 'href="/md5/[a-f0-9]{32}"' | \
             sed 's/href="\/md5\///; s/"$//' | head -10 | sort -u
     }
 
     echo ""
-    echo "Usage: aa-book add <md5> \"reason for adding\""
-    echo "       aa-book add <md5> \"reason\" -b  # background mode"
+    echo "Usage: aa-book download <md5>"
 }
 
+# --- Download ---
+# Uses agent-browser to navigate the fast_download?no_redirect=1 page
+# and extract the CDN URL, then downloads with curl and SCPs to NAS.
 download_book() {
     local md5="$1"
-    local output_dir="${2:-$INCOMING_DIR}"
+    local output_dir="${2:-$LOCAL_STAGING}"
     local max_retries=3
-    local timeout=60
-    
+
     status "Downloading md5: $md5"
-    
+
     # Track daily downloads (25/day limit)
     local today=$(date +%Y-%m-%d)
     local count_file="${CONFIG_DIR}/download_count_${today}.txt"
     local count=$(cat "$count_file" 2>/dev/null || echo 0)
-    
+
     if [[ $count -ge 25 ]]; then
         error "Daily download limit reached (25/day). Try tomorrow."
         return 1
     fi
-    
+
+    # Ensure browser is authenticated
+    ensure_browser_auth
+
+    # Try each fast partner server via no_redirect page
     local download_url=""
-    local last_server_file="${CONFIG_DIR}/last_working_server.txt"
-    local server=$(cat "$last_server_file" 2>/dev/null || echo 6)  # Use last working or default to 6
+    for server in 0 1 2 3 4 5; do
+        status "Trying Fast Partner Server #$((server + 1))..."
+        agent-browser open "${BASE_URL}/fast_download/${md5}/0/${server}?no_redirect=1" 2>/dev/null
+        agent-browser wait --load networkidle 2>/dev/null
 
-    # Try different servers on failure, working backwards
-    for attempt in $(seq 1 $max_retries); do
-        status "Attempt $attempt: Getting download URL (server $server)..."
+        # Extract CDN URL — look for links to partner CDN domains
+        download_url=$(agent-browser eval 'Array.from(document.querySelectorAll("a[href]")).map(a=>a.href).find(h=>/\/(d[0-9]|get)\//.test(h)||/\.(pdf|epub|mobi)$/.test(h))||""' 2>/dev/null | tr -d '"')
 
-        download_url=$(curl -s -I -b "$COOKIE_FILE" --connect-timeout 10 --max-time 30 \
-            "${BASE_URL}/fast_download/${md5}/0/${server}" 2>/dev/null | \
-            grep -i '^location:' | sed 's/location: //i' | tr -d '\r\n')
-
-        if [[ -n "$download_url" && "$download_url" != *"not_member"* ]]; then
-            # Remember this server for next time
-            echo "$server" > "$last_server_file"
+        if [[ -n "$download_url" && "$download_url" != "" ]]; then
+            log "Got CDN URL from server #$((server + 1))"
             break
         fi
-
-        warn "Server $server failed, trying next..."
-        server=$((server - 1))
-        [[ $server -lt 0 ]] && server=6  # Wrap back to 6
-        sleep 2
+        sleep 1
     done
-    
-    if [[ -z "$download_url" || "$download_url" == *"not_member"* ]]; then
-        error "Could not get download URL after $max_retries attempts"
+
+    if [[ -z "$download_url" ]]; then
+        error "Could not get download URL from any server"
         return 1
     fi
-    
-    local orig_filename=$(echo "$download_url" | sed 's/.*\///' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-    
-    # Shorten filename: extract title and extension only
-    local extension="${orig_filename##*.}"
-    local title=$(echo "$orig_filename" | sed 's/ -- .*//; s/[^a-zA-Z0-9 ]//g' | cut -c1-80)
-    local filename="${title}.${extension}"
+
+    # Derive filename
+    local decoded_filename=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1].split('/')[-1]))" "$download_url")
+    local extension="${decoded_filename##*.}"
+    local slug=$(echo "$decoded_filename" | sed 's/ -- .*//; s/[^a-zA-Z0-9 ]//g; s/  */ /g' | cut -c1-80 | sed 's/ /-/g' | tr '[:upper:]' '[:lower:]')
+    local filename="${slug}.${extension}"
     local filepath="${output_dir}/${filename}"
-    
-    log "Downloading: $orig_filename"
+
+    log "Downloading: $decoded_filename"
     log "Saving as: $filename"
-    log "Timeout: ${timeout}s"
-    
-    # Download with timeout and retry
+
     for attempt in $(seq 1 $max_retries); do
         if curl -L -o "$filepath" "$download_url" --connect-timeout 15 --max-time 300 --progress-bar 2>&1; then
-            # Verify file was actually downloaded
-            if [[ -f "$filepath" && $(stat -c%s "$filepath" 2>/dev/null || echo 0) -gt 1000 ]]; then
-                # Increment download count
+            if [[ -f "$filepath" && $(stat -f%z "$filepath" 2>/dev/null || echo 0) -gt 1000 ]]; then
                 echo $((count + 1)) > "$count_file"
                 log "Download count today: $((count + 1))/25"
                 break
@@ -174,13 +216,13 @@ download_book() {
         rm -f "$filepath" 2>/dev/null
         sleep 3
     done
-    
+
     if [[ ! -f "$filepath" ]]; then
         error "Download failed after $max_retries attempts"
         return 1
     fi
-    
-    # Convert epub/mobi to pdf
+
+    # Convert epub/mobi to pdf if Calibre available
     if [[ "$extension" == "epub" || "$extension" == "mobi" ]] && command -v ebook-convert &> /dev/null; then
         local pdf_path="${filepath%.*}.pdf"
         status "Converting $extension to PDF..."
@@ -190,102 +232,25 @@ download_book() {
             warn "Conversion failed, keeping original"
         fi
     fi
-    
+
+    # Transfer to NAS
+    local year=$(date +%Y)
+    local nas_dir="${NAS_BOOKS_DIR}/${year}"
+    status "Transferring to NAS: ${NAS_HOST}:${nas_dir}/"
+    ssh "$NAS_HOST" "mkdir -p '${nas_dir}'" 2>/dev/null
+    if scp "$filepath" "${NAS_HOST}:${nas_dir}/$(basename "$filepath")" 2>&1; then
+        log "Stored on NAS: ${nas_dir}/$(basename "$filepath")"
+    else
+        warn "NAS transfer failed — file kept at $filepath"
+    fi
+
     echo "$filepath"
 }
 
-ingest_book() {
-    local filepath="$1"
-    local reason="$2"
-    
-    status "Ingesting into pdf-brain: $filepath"
-    
-    # Verify file exists
-    if [[ ! -f "$filepath" ]]; then
-        error "File not found: $filepath"
-        return 1
-    fi
-    
-    # Run pdf-brain add
-    local output=$(pdf-brain add "$filepath" 2>&1)
-    echo "$output" >> "$PROGRESS_LOG"
-    
-    if echo "$output" | grep -q "DocumentExistsError"; then
-        warn "Book already exists in pdf-brain"
-    elif echo "$output" | grep -q "Error"; then
-        warn "Ingestion had errors - check log"
-    else
-        log "Ingestion complete"
-    fi
-    
-    # Extract title for memory
-    local title=$(basename "$filepath" .pdf | sed 's/_/ /g')
-    
-    echo "$title"
-}
-
-log_memory() {
-    local title="$1"
-    local reason="$2"
-    local md5="$3"
-    
-    status "Logging to hivemind..."
-    
-    local memory="Book added to pdf-brain ($(date +%Y-%m-%d)): \"$title\"
-MD5: $md5
-Reason: $reason
-Use: Search pdf-brain for concepts from this book when relevant."
-
-    # Use swarm memory store if available
-    if command -v swarm &> /dev/null; then
-        swarm memory store "$memory" --tags "pdf-brain,books,reference" 2>&1 | tee -a "$PROGRESS_LOG"
-    else
-        echo "$memory" >> "${HOME}/clawd/memory/books-added.md"
-        log "Logged to ~/clawd/memory/books-added.md"
-    fi
-}
-
-cleanup() {
-    local filepath="$1"
-    if [[ -f "$filepath" ]]; then
-        rm "$filepath"
-        log "Cleaned up: $filepath"
-    fi
-}
-
-# Full pipeline: download → convert → ingest → log → cleanup
-add_book() {
-    local md5="$1"
-    local reason="${2:-Reference material}"
-    local background="${3:-false}"
-    
-    # Clear progress log
-    echo "=== aa-book add $md5 ===" > "$PROGRESS_LOG"
-    echo "Started: $(date)" >> "$PROGRESS_LOG"
-    echo "Reason: $reason" >> "$PROGRESS_LOG"
-    echo "" >> "$PROGRESS_LOG"
-    
-    if [[ "$background" == "--background" || "$background" == "-b" ]]; then
-        nohup bash -c "
-            export PATH=\"\$HOME/.local/bin:\$PATH\"
-            source ~/Code/joelhooks/aa-download/bin/aa-book
-            _run_pipeline '$md5' '$reason'
-        " >> "$PROGRESS_LOG" 2>&1 &
-        local pid=$!
-        echo "$pid" > "${CONFIG_DIR}/current_job.pid"
-        echo "🚀 Running in background (PID: $pid)"
-        echo "   Monitor: tail -f $PROGRESS_LOG"
-        echo "   Or: aa-book status"
-        return 0
-    fi
-    
-    _run_pipeline "$md5" "$reason"
-}
-
-# Check status of background job
+# --- Status ---
 check_status() {
     local pid_file="${CONFIG_DIR}/current_job.pid"
-    
+
     if [[ -f "$pid_file" ]]; then
         local pid=$(cat "$pid_file")
         if ps -p "$pid" > /dev/null 2>&1; then
@@ -303,57 +268,38 @@ check_status() {
         echo "No active job"
         [[ -f "$PROGRESS_LOG" ]] && echo "Last log: tail -f $PROGRESS_LOG"
     fi
-    
-    # Show daily quota
+
     local today=$(date +%Y-%m-%d)
     local count=$(cat "${CONFIG_DIR}/download_count_${today}.txt" 2>/dev/null || echo 0)
     echo ""
     echo "📊 Downloads today: $count/25"
 }
 
-_run_pipeline() {
-    local md5="$1"
-    local reason="$2"
-    
-    check_login || do_login
-    
-    local filepath=$(download_book "$md5")
-    local title=$(ingest_book "$filepath" "$reason")
-    log_memory "$title" "$reason" "$md5"
-    cleanup "$filepath"
-    
-    echo ""
-    status "✅ Complete: $title"
-    echo "Completed: $(date)" >> "$PROGRESS_LOG"
-}
-
+# --- Help ---
 show_help() {
-    echo "aa-book - Anna's Archive → pdf-brain pipeline"
+    echo "aa-book — Anna's Archive → NAS book pipeline"
     echo ""
     echo "Commands:"
-    echo "  search <query> [format]     Search for books (format: pdf, epub, mobi)"
-    echo "  download <md5> [dir]        Download only (with epub→pdf conversion)"
-    echo "  add <md5> \"<reason>\"        Full pipeline: download → ingest → log → cleanup"
-    echo "  add <md5> \"<reason>\" -b     Run in background (non-blocking)"
-    echo "  status                      Check background job & daily quota"
-    echo "  login                       Force re-login"
+    echo "  search <query> [format]     Search (format: pdf, epub, mobi)"
+    echo "  download <md5> [dir]        Download → convert → SCP to NAS"
+    echo "  status                      Check job & daily quota"
+    echo "  login                       Force browser re-login"
     echo ""
     echo "Examples:"
-    echo "  aa-book search 'designing data intensive'       # All formats (PDFs first)"
-    echo "  aa-book search 'clean architecture' pdf         # PDFs only"
-    echo "  aa-book add abc123def456 'Distributed systems reference' -b"
+    echo "  aa-book search 'designing data intensive' pdf"
+    echo "  aa-book download eaa2571df81dc9fa85cafaa89db7e81a"
     echo "  aa-book status"
     echo ""
+    echo "Auth: agent-secrets (annas_archive_key) + agent-browser"
+    echo "Storage: ${NAS_HOST}:${NAS_BOOKS_DIR}/YYYY/"
     echo "Daily limit: 25 fast downloads"
-    echo "Progress log: $PROGRESS_LOG"
 }
 
-# Main
+# --- Main ---
 case "${1:-}" in
     search)
         shift
-        check_login || do_login
-        # Check if last arg is a format filter
+        check_curl_login || curl_login
         if [[ "$#" -ge 2 && "${!#}" =~ ^(pdf|epub|mobi)$ ]]; then
             format="${!#}"
             query="${*:1:$#-1}"
@@ -362,10 +308,9 @@ case "${1:-}" in
             search_books "$*"
         fi
         ;;
-    download) check_login || do_login; download_book "$2" "${3:-}" ;;
-    add) check_login || do_login; add_book "$2" "$3" "$4" ;;
+    download) download_book "$2" "${3:-}" ;;
     status) check_status ;;
-    login) do_login ;;
+    login) browser_login ;;
     help|--help|-h) show_help ;;
     *) show_help ;;
 esac
