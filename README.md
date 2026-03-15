@@ -35,6 +35,7 @@ aa-book search "designing data intensive applications" pdf
 # Download to staging or custom dir
 aa-book download <md5>
 aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming
+aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming --keep-local
 
 # Status / login
 aa-book status

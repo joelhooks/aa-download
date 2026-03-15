@@ -18,6 +18,7 @@ aa-book search "clean architecture" pdf    # PDFs only
 # Download
 aa-book download <md5>
 aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming
+aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming --keep-local
 
 # Check status & quota
 aa-book status
@@ -35,14 +36,14 @@ aa-book search "query terms" [format]
 
 ### download
 ```bash
-aa-book download <md5> [output_dir]
+aa-book download <md5> [output_dir] [--keep-local]
 ```
 Steps:
 1. Ensure browser login/session
 2. Resolve partner download URL
 3. Download file (retry)
 4. Convert epub/mobi to PDF if possible
-5. Copy to NAS (`/volume1/home/joel/books/YYYY/`)
+5. Copy to NAS (`/volume1/home/joel/books/YYYY/`) unless `--keep-local` is set
 
 ### status
 ```bash

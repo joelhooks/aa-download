@@ -8,7 +8,52 @@ set -e
 COOKIE_FILE="${HOME}/.config/annas-archive/cookies.txt"
 SESSION_FILE="${HOME}/.config/annas-archive/aa-session.json"
 CONFIG_DIR="${HOME}/.config/annas-archive"
-BASE_URL="https://annas-archive.li"
+# Self-healing mirror discovery
+# Primary source: Wikipedia (AA's own recommendation for current domains)
+# Fallback: cached mirrors file + hardcoded seeds
+MIRRORS_CACHE="${CONFIG_DIR}/mirrors.txt"
+MIRRORS_CACHE_TTL=86400  # refresh daily
+
+discover_mirrors() {
+  # Scrape current TLDs from Wikipedia + Reddit sidebar
+  local wiki_mirrors
+  wiki_mirrors=$(curl -sL --connect-timeout 5 "https://en.wikipedia.org/wiki/Anna%27s_Archive" 2>/dev/null \
+    | grep -oE 'annas-archive\.[a-z]{2,3}' | sort -u | head -10)
+  # Reddit sidebar often has latest domains
+  local reddit_mirrors
+  reddit_mirrors=$(curl -sL --connect-timeout 5 -H "User-Agent: aa-book/1.0" \
+    "https://old.reddit.com/r/Annas_Archive" 2>/dev/null \
+    | grep -oE 'annas-archive\.[a-z]{2,3}' | sort -u | head -10)
+  wiki_mirrors=$(echo -e "$wiki_mirrors\n$reddit_mirrors" | sort -u)
+  {
+    for m in $wiki_mirrors; do echo "https://$m"; done
+    # Hardcoded seeds as last resort
+    echo "https://annas-archive.gl"
+    echo "https://annas-archive.li"
+    echo "https://welib.org"
+  } | sort -u | grep -v '^$'
+}
+
+resolve_base_url() {
+  local mirrors
+  # Refresh cache if stale or missing
+  if [[ ! -f "$MIRRORS_CACHE" ]] || [[ $(($(date +%s) - $(stat -f%m "$MIRRORS_CACHE" 2>/dev/null || echo 0))) -gt $MIRRORS_CACHE_TTL ]]; then
+    mirrors=$(discover_mirrors)
+    [[ -n "$mirrors" ]] && echo "$mirrors" > "$MIRRORS_CACHE"
+  fi
+  # Read from cache (or seeds if cache empty)
+  mirrors=$(cat "$MIRRORS_CACHE" 2>/dev/null || echo "https://annas-archive.gl")
+  
+  for mirror in $mirrors; do
+    if curl -sI --connect-timeout 4 "$mirror" 2>/dev/null | head -1 | grep -qE "200|403|302"; then
+      echo "$mirror"
+      return 0
+    fi
+  done
+  return 1
+}
+
+BASE_URL=$(resolve_base_url) || { error "All Anna's Archive mirrors unreachable. Run 'aa-book mirrors' to diagnose."; exit 1; }
 LOCAL_STAGING="/tmp/aa-book"
 NAS_HOST="joel@three-body"
 NAS_BOOKS_DIR="/volume1/home/joel/books"
@@ -146,16 +191,31 @@ for md5, title, size, fmt, disp in results[:15]:
     }
 
     echo ""
-    echo "Usage: aa-book download <md5>"
+    echo "Usage: aa-book download <md5> [output_dir] [--keep-local]"
 }
 
 # --- Download ---
 # Uses agent-browser to navigate the fast_download?no_redirect=1 page
-# and extract the CDN URL, then downloads with curl and SCPs to NAS.
+# and extract the CDN URL, then downloads with curl and optionally SCPs to NAS.
 download_book() {
-    local md5="$1"
-    local output_dir="${2:-$LOCAL_STAGING}"
+    local keep_local=0
+    local args=()
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --keep-local) keep_local=1 ;;
+            *) args+=("$1") ;;
+        esac
+        shift
+    done
+
+    local md5="${args[0]}"
+    local output_dir="${args[1]:-$LOCAL_STAGING}"
     local max_retries=3
+
+    if [[ -z "$md5" ]]; then
+        error "Usage: aa-book download <md5> [output_dir] [--keep-local]"
+        return 1
+    fi
 
     status "Downloading md5: $md5"
 
@@ -233,15 +293,25 @@ download_book() {
         fi
     fi
 
-    # Transfer to NAS
+    if [[ "$keep_local" -eq 1 ]]; then
+        echo "$filepath"
+        return 0
+    fi
+
+    # Transfer to NAS (graceful — queue for retry if unreachable)
     local year=$(date +%Y)
     local nas_dir="${NAS_BOOKS_DIR}/${year}"
+    local deferred_queue="${CONFIG_DIR}/deferred-transfers.txt"
     status "Transferring to NAS: ${NAS_HOST}:${nas_dir}/"
-    ssh "$NAS_HOST" "mkdir -p '${nas_dir}'" 2>/dev/null
-    if scp "$filepath" "${NAS_HOST}:${nas_dir}/$(basename "$filepath")" 2>&1; then
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "$NAS_HOST" "mkdir -p '${nas_dir}'" 2>/dev/null && \
+       scp -o ConnectTimeout=10 "$filepath" "${NAS_HOST}:${nas_dir}/$(basename "$filepath")" 2>/dev/null; then
         log "Stored on NAS: ${nas_dir}/$(basename "$filepath")"
+        # Clean local staging copy
+        rm -f "$filepath" 2>/dev/null
     else
-        warn "NAS transfer failed — file kept at $filepath"
+        warn "NAS unreachable — file kept at $filepath"
+        warn "Queued for deferred transfer"
+        echo "$(date -Iseconds)|${filepath}|${nas_dir}/$(basename "$filepath")" >> "$deferred_queue"
     fi
 
     echo "$filepath"
@@ -275,19 +345,67 @@ check_status() {
     echo "📊 Downloads today: $count/25"
 }
 
+# --- Sync deferred transfers ---
+sync_deferred() {
+    local deferred_queue="${CONFIG_DIR}/deferred-transfers.txt"
+    if [[ ! -f "$deferred_queue" || ! -s "$deferred_queue" ]]; then
+        echo "✅ No deferred transfers"
+        return 0
+    fi
+
+    # Check NAS reachability first
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$NAS_HOST" "echo ok" &>/dev/null; then
+        error "NAS still unreachable"
+        echo "Pending transfers:"
+        cat "$deferred_queue" | while IFS='|' read -r ts src dst; do
+            echo "  $(basename "$src") (queued $ts)"
+        done
+        return 1
+    fi
+
+    local remaining=""
+    while IFS='|' read -r ts src dst; do
+        [[ -z "$src" ]] && continue
+        if [[ ! -f "$src" ]]; then
+            warn "Source gone: $src (skipping)"
+            continue
+        fi
+        local nas_dir
+        nas_dir="$(dirname "$dst")"
+        ssh -o ConnectTimeout=5 "$NAS_HOST" "mkdir -p '${NAS_BOOKS_DIR}/${nas_dir##*/books/}'" 2>/dev/null || true
+        if scp -o ConnectTimeout=10 "$src" "${NAS_HOST}:${NAS_BOOKS_DIR}/${nas_dir##*/books/}/$(basename "$dst")" 2>/dev/null; then
+            log "Synced: $(basename "$src")"
+            rm -f "$src" 2>/dev/null
+        else
+            warn "Still failed: $(basename "$src")"
+            remaining+="${ts}|${src}|${dst}\n"
+        fi
+    done < "$deferred_queue"
+
+    if [[ -n "$remaining" ]]; then
+        echo -e "$remaining" > "$deferred_queue"
+    else
+        rm -f "$deferred_queue"
+        log "All deferred transfers complete"
+    fi
+}
+
 # --- Help ---
 show_help() {
     echo "aa-book — Anna's Archive → NAS book pipeline"
     echo ""
     echo "Commands:"
     echo "  search <query> [format]     Search (format: pdf, epub, mobi)"
-    echo "  download <md5> [dir]        Download → convert → SCP to NAS"
+    echo "  download <md5> [dir] [--keep-local]"
+    echo "                              Download → convert → optional SCP to NAS"
+    echo "  sync                        Retry deferred NAS transfers"
     echo "  status                      Check job & daily quota"
     echo "  login                       Force browser re-login"
     echo ""
     echo "Examples:"
     echo "  aa-book search 'designing data intensive' pdf"
     echo "  aa-book download eaa2571df81dc9fa85cafaa89db7e81a"
+    echo "  aa-book download eaa2571df81dc9fa85cafaa89db7e81a /tmp/books --keep-local"
     echo "  aa-book status"
     echo ""
     echo "Auth: agent-secrets (annas_archive_key) + agent-browser"
@@ -308,9 +426,31 @@ case "${1:-}" in
             search_books "$*"
         fi
         ;;
-    download) download_book "$2" "${3:-}" ;;
+    download)
+        shift
+        download_book "$@"
+        ;;
+    sync) sync_deferred ;;
     status) check_status ;;
     login) browser_login ;;
+    mirrors)
+        log "Discovering mirrors..."
+        all=$(discover_mirrors)
+        echo "$all" > "$MIRRORS_CACHE"
+        for m in $all; do
+            code=$(curl -sI --connect-timeout 4 "$m" 2>/dev/null | head -1 | awk '{print $2}')
+            [[ -z "$code" ]] && code="DEAD"
+            if [[ "$code" == "200" ]]; then
+                echo -e "  ${GREEN}✓${NC} $m ($code)"
+            elif [[ "$code" =~ ^[23] ]]; then
+                echo -e "  ${YELLOW}~${NC} $m ($code)"
+            else
+                echo -e "  ${RED}✗${NC} $m ($code)"
+            fi
+        done
+        log "Active: $BASE_URL"
+        log "Cache: $MIRRORS_CACHE"
+        ;;
     help|--help|-h) show_help ;;
     *) show_help ;;
 esac
