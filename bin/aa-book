@@ -44,8 +44,17 @@ resolve_base_url() {
   # Read from cache (or seeds if cache empty)
   mirrors=$(cat "$MIRRORS_CACHE" 2>/dev/null || echo "https://annas-archive.gl")
   
+  # Prefer mirrors that answer 200/302 — a 403 is usually a Cloudflare
+  # challenge page that breaks every subsequent curl call (search returns
+  # nothing) even though browser-driven flows can pass it.
   for mirror in $mirrors; do
-    if curl -sI --connect-timeout 4 "$mirror" 2>/dev/null | head -1 | grep -qE "200|403|302"; then
+    if curl -sI --connect-timeout 4 "$mirror" 2>/dev/null | head -1 | grep -qE "200|302"; then
+      echo "$mirror"
+      return 0
+    fi
+  done
+  for mirror in $mirrors; do
+    if curl -sI --connect-timeout 4 "$mirror" 2>/dev/null | head -1 | grep -qE "403"; then
       echo "$mirror"
       return 0
     fi
@@ -192,6 +201,8 @@ for md5, title, size, fmt, disp in results[:15]:
 
     echo ""
     echo "Usage: aa-book download <md5> [output_dir] [--keep-local]"
+    echo "No results? Mirrors flap (transient 502s) and Cloudflare-shielded ones blank curl search."
+    echo "Retry after 'aa-book mirrors', or use the agent-browser fallback in the aa-book skill."
 }
 
 # --- Download ---
