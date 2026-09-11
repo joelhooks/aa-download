@@ -86,23 +86,29 @@ tail -f /tmp/aa-book-progress.log
 aa-book status
 ```
 
-## When search returns nothing: the browser fallback
+## When search returns nothing
 
-`aa-book search` is curl-based and dies silently when mirrors are bot-shielded or flapping — an empty result list with just the Usage line does NOT mean the book isn't there. Verified failure modes (2026-07-13): mirrors returning transient 502s to curl while rendering fine in a real browser; `annas-archive.li` serving a literal `"OK"` stub; `welib.org` sitting behind a Cloudflare challenge that curl can't clear.
+`aa-book search` is curl-based. As of 2026-09-10 every Anna's Archive mirror
+302s `/search` into a DDoS-Guard bot check that curl cannot pass, so the AA
+half of search is blank. `aa-book search` now handles this itself:
 
-Recovery ladder:
+1. AA search returns no md5 links → it warns and **falls back to Libgen**
+   (`libgen.li`, then `libgen.vg`). Libgen shares md5s with Anna's Archive, so
+   any md5 it prints goes straight into `aa-book download`, which is
+   browser-driven and still works through a shielded mirror. Verified
+   end-to-end 2026-09-10 (Rebuilding Milo: Libgen md5 → fast partner → NAS).
+2. Libgen also empty → `aa-book mirrors` re-probes. Statuses mean:
+   - `ok` — curl search works on this mirror
+   - `shielded` — bot check; search blank, download fine (this is normal now)
+   - `parked` — squatter page (`annas-archive.li` since ~2026-09); never used
+   - `dead` / `http-NNN` — unreachable
+3. Still nothing → the book probably isn't on either index under that title.
+   Try author name or ISBN as the query before giving up.
 
-1. `aa-book mirrors` — re-probe; transient 502s often clear in minutes. Retry the search.
-2. Still empty → search through `agent-browser` (which holds the login session):
-
-```bash
-agent-browser open "https://annas-archive.gd/search?q=<query+terms>"
-agent-browser wait --load networkidle --timeout 15000
-# Filter by title match — the page has decoy md5 links (carousels, random books):
-agent-browser eval "Array.from(document.querySelectorAll('a[href*=\"/md5/\"]')).filter(a=>/<title regex>/i.test(a.textContent||'')).slice(0,8).map(a => { const row=(a.closest('div')?.parentElement?.innerText||'').replace(/\s+/g,' '); const meta=(row.match(/(English|Spanish|German)[^·]*·[^·]*·[^·]*·[^·]*/)||[''])[0]; return a.getAttribute('href').split('/md5/')[1].slice(0,32)+'  '+meta.slice(0,90)+'  '+(a.textContent||'').trim().slice(0,60); }).join('\n')"
-```
-
-3. Verify the chosen md5 page has Fast Partner links before downloading:
+The old agent-browser search fallback (open `/search` in the logged-in
+browser) is **dead**: DDoS-Guard serves a manual "I'm not a robot" checkbox to
+agent-browser and clicking it by coordinates does not clear it. Don't burn
+time on it. The md5 page check below still works if you already have an md5:
 
 ```bash
 agent-browser open "https://annas-archive.gd/md5/<md5>"
@@ -110,12 +116,10 @@ agent-browser wait --load networkidle --timeout 15000
 agent-browser eval "Array.from(document.querySelectorAll('a')).filter(a=>/fast partner/i.test(a.textContent||'')).length"
 ```
 
-4. `aa-book download <md5> ...` as normal — the download path is browser-driven and works even when curl search doesn't.
-
 ## Gotchas
 
 - **Anna's Archive format labels can lie** — A "pdf"-labeled md5 may be a zip/epub. Verify the `/md5/<hash>` page has a Fast Partner Server link before downloading; prefer passing an explicit verified md5.
 - **Libgen-slow-only md5s** — Some md5s fail with bare exit 1 on `aa-book download`. No retry; pick a different copy.
 - **azw3 conversion** — azw3 needs conversion to PDF before docs-ingest. aa-book's auto-convert historically only covered epub/mobi; a March-2026 azw3 of A Pattern Language sat on the NAS unconverted and never reached the docs brain — the gotcha is real. Verify before relying on it.
-- **Cloudflare-403 mirror trap** — the mirror resolver treats an HTTP 403 as "reachable", but a 403 from Cloudflare means every subsequent curl call (search especially) silently fails. The resolver now prefers 200/302 mirrors and only falls back to 403 ones; if search goes quiet, check which mirror is Active in `aa-book mirrors` output.
+- **Status codes lie about mirror health** — a parked domain answers 200 and a DDoS-Guard mirror answers 200 on `/` then 302s `/search` into a check page. The resolver now classifies mirrors by fetching `/search?q=test` and looking for md5 links (`ok`), a bot-check page (`shielded`), or squatter text (`parked`). It prefers `ok`, accepts `shielded` (download still works), never picks `parked`/`dead`, and caches the pick for an hour in `~/.config/annas-archive/active-mirror.txt`. `aa-book mirrors` forces a re-probe.
 - **This skill's source of truth** is `~/Code/joelhooks/aa-download/skills/SKILL.md`; `~/.claude/skills/aa-book` is a symlink. Edit in the repo, commit, push — same-session, like any durable surface.

@@ -34,6 +34,35 @@ discover_mirrors() {
   } | sort -u | grep -v '^$'
 }
 
+# Classify a mirror by what curl actually gets back from a search, not by
+# the status code of GET /. Verified 2026-09-10: annas-archive.li answered
+# 200 as a parked "domain may be for sale" page, and the .gd/.gl/.pk mirrors
+# answered 200 on / but 302'd every /search into a DDoS-Guard check page.
+#   ok       search returns md5 links; curl search works
+#   shielded bot check page; curl search is blank, browser-driven download still works
+#   parked   domain squatter page
+#   dead     no answer / no HTML
+probe_mirror() {
+  local mirror="$1" body code
+  body=$(curl -sL --connect-timeout 4 -m 12 -w '\n__CODE__%{http_code}' "${mirror}/search?q=test" 2>/dev/null) || body=""
+  code="${body##*__CODE__}"
+  body="${body%__CODE__*}"
+  if [[ -z "$body" || "$code" == "000" ]]; then
+    echo dead
+  elif echo "$body" | grep -qiE 'domain may be for sale|domain is for sale|buy this domain'; then
+    echo parked
+  elif echo "$body" | grep -q '/md5/'; then
+    echo ok
+  elif echo "$body" | grep -qiE 'ddos-guard|checking your browser|just a moment|cf-challenge|__cf_chl'; then
+    echo shielded
+  else
+    echo "http-${code}"
+  fi
+}
+
+ACTIVE_MIRROR_CACHE="${CONFIG_DIR}/active-mirror.txt"
+ACTIVE_MIRROR_TTL=3600  # re-probe hourly; 'aa-book mirrors' forces it
+
 resolve_base_url() {
   local mirrors
   # Refresh cache if stale or missing
@@ -41,24 +70,35 @@ resolve_base_url() {
     mirrors=$(discover_mirrors)
     [[ -n "$mirrors" ]] && echo "$mirrors" > "$MIRRORS_CACHE"
   fi
+  # Reuse the last good pick for an hour so every command doesn't re-probe
+  if [[ -z "$AA_FORCE_PROBE" && -f "$ACTIVE_MIRROR_CACHE" ]] && \
+     [[ $(($(date +%s) - $(stat -f%m "$ACTIVE_MIRROR_CACHE" 2>/dev/null || echo 0))) -lt $ACTIVE_MIRROR_TTL ]]; then
+    local cached
+    cached=$(cat "$ACTIVE_MIRROR_CACHE" 2>/dev/null)
+    [[ -n "$cached" ]] && { echo "$cached"; return 0; }
+  fi
   # Read from cache (or seeds if cache empty)
   mirrors=$(cat "$MIRRORS_CACHE" 2>/dev/null || echo "https://annas-archive.gl")
-  
-  # Prefer mirrors that answer 200/302 — a 403 is usually a Cloudflare
-  # challenge page that breaks every subsequent curl call (search returns
-  # nothing) even though browser-driven flows can pass it.
+
+  # Prefer a mirror whose search actually works for curl. A shielded mirror
+  # is second best: search is blank but the browser-driven download path
+  # still resolves fast-partner URLs through it. Never pick parked or dead.
+  local mirror status shielded=""
   for mirror in $mirrors; do
-    if curl -sI --connect-timeout 4 "$mirror" 2>/dev/null | head -1 | grep -qE "200|302"; then
+    status=$(probe_mirror "$mirror")
+    if [[ "$status" == "ok" ]]; then
+      echo "$mirror" > "$ACTIVE_MIRROR_CACHE"
       echo "$mirror"
       return 0
+    elif [[ "$status" == "shielded" && -z "$shielded" ]]; then
+      shielded="$mirror"
     fi
   done
-  for mirror in $mirrors; do
-    if curl -sI --connect-timeout 4 "$mirror" 2>/dev/null | head -1 | grep -qE "403"; then
-      echo "$mirror"
-      return 0
-    fi
-  done
+  if [[ -n "$shielded" ]]; then
+    echo "$shielded" > "$ACTIVE_MIRROR_CACHE"
+    echo "$shielded"
+    return 0
+  fi
   return 1
 }
 
@@ -168,7 +208,15 @@ search_books() {
     log "Searching: $query"
     [[ -n "$format_filter" ]] && log "Format filter: $format_filter"
 
-    local html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/search?q=$(echo "$query" | sed 's/ /+/g')")
+    local html=$(curl -sL -m 20 -b "$COOKIE_FILE" "${BASE_URL}/search?q=$(echo "$query" | sed 's/ /+/g')")
+
+    if ! echo "$html" | grep -q '/md5/'; then
+        warn "Anna's Archive search returned no md5 links from $BASE_URL (bot-shielded or flapping). Trying Libgen..."
+        search_libgen "$query" "$format_filter"
+        echo ""
+        echo "Usage: aa-book download <md5> [output_dir] [--keep-local]"
+        return 0
+    fi
 
     echo "$html" | python3 -c "
 import sys, re
@@ -203,6 +251,55 @@ for md5, title, size, fmt, disp in results[:15]:
     echo "Usage: aa-book download <md5> [output_dir] [--keep-local]"
     echo "No results? Mirrors flap (transient 502s) and Cloudflare-shielded ones blank curl search."
     echo "Retry after 'aa-book mirrors', or use the agent-browser fallback in the aa-book skill."
+}
+
+# Libgen shares md5s with Anna's Archive, and its mirrors answer plain curl
+# when AA's are bot-shielded. Any md5 printed here feeds 'aa-book download'
+# unchanged. Verified 2026-09-10 (Rebuilding Milo via libgen.li).
+LIBGEN_MIRRORS="https://libgen.li https://libgen.vg"
+
+search_libgen() {
+    local query="$1"
+    local format_filter="${2:-}"
+    local q mirror html
+    q=$(echo "$query" | sed 's/ /+/g')
+    for mirror in $LIBGEN_MIRRORS; do
+        html=$(curl -sL --connect-timeout 5 -m 25 -A "Mozilla/5.0" \
+            "${mirror}/index.php?req=${q}&columns%5B%5D=t&res=25" 2>/dev/null) || html=""
+        echo "$html" | grep -q '/md5/' && break
+        html=""
+    done
+    if [[ -z "$html" ]]; then
+        echo "  (libgen mirrors returned nothing either)"
+        return 1
+    fi
+    log "Libgen results via $mirror (same md5s work with 'aa-book download')"
+    echo "$html" | python3 -c "
+import sys, re
+from html import unescape
+html = sys.stdin.read()
+format_filter = '$format_filter'.lower()
+seen = set(); results = []
+for row in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
+    m = re.search(r'/md5/([a-f0-9]{32})', row)
+    if not m: continue
+    md5 = m.group(1)
+    if md5 in seen: continue
+    seen.add(md5)
+    cells = [re.sub(r'\s+', ' ', unescape(re.sub(r'<[^>]+>', ' ', c))).strip()
+             for c in re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)]
+    if len(cells) < 8: continue
+    # libgen.li columns: title, author, publisher, year, lang, pages, size, ext, ...
+    t = re.search(r'<a[^>]*edition\.php[^>]*>(.*?)</a>', row, re.S)
+    title = re.sub(r'\s+', ' ', unescape(re.sub(r'<[^>]+>', ' ', t.group(1)))).strip()[:60] if t else cells[0][:60]
+    author, size, fmt = cells[1][:30], cells[6], cells[7].lower()
+    if format_filter and fmt != format_filter: continue
+    color = '\033[32m' if fmt == 'pdf' else '\033[33m'
+    results.append((md5, title, author, size, fmt, f'{color}{fmt}\033[0m'))
+results.sort(key=lambda x: (0 if x[4] == 'pdf' else 1, x[4]))
+for md5, title, author, size, fmt, disp in results[:15]:
+    print(f'{md5}  {disp:12} {size:>8}  {title}  [{author}]')
+"
 }
 
 # --- Download ---
@@ -449,16 +546,16 @@ case "${1:-}" in
         all=$(discover_mirrors)
         echo "$all" > "$MIRRORS_CACHE"
         for m in $all; do
-            code=$(curl -sI --connect-timeout 4 "$m" 2>/dev/null | head -1 | awk '{print $2}')
-            [[ -z "$code" ]] && code="DEAD"
-            if [[ "$code" == "200" ]]; then
-                echo -e "  ${GREEN}✓${NC} $m ($code)"
-            elif [[ "$code" =~ ^[23] ]]; then
-                echo -e "  ${YELLOW}~${NC} $m ($code)"
-            else
-                echo -e "  ${RED}✗${NC} $m ($code)"
-            fi
+            status=$(probe_mirror "$m")
+            case "$status" in
+                ok)       echo -e "  ${GREEN}✓${NC} $m (ok: curl search works)" ;;
+                shielded) echo -e "  ${YELLOW}~${NC} $m (shielded: bot check blanks curl search; browser download still works)" ;;
+                parked)   echo -e "  ${RED}✗${NC} $m (parked domain)" ;;
+                *)        echo -e "  ${RED}✗${NC} $m ($status)" ;;
+            esac
         done
+        rm -f "$ACTIVE_MIRROR_CACHE"
+        BASE_URL=$(AA_FORCE_PROBE=1 resolve_base_url) || { error "No usable mirror. Search falls back to Libgen; downloads need a live AA mirror."; exit 1; }
         log "Active: $BASE_URL"
         log "Cache: $MIRRORS_CACHE"
         ;;
