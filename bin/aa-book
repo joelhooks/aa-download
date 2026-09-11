@@ -102,10 +102,26 @@ resolve_base_url() {
   return 1
 }
 
+read_env_file_value() {
+    local key="$1" env_file="${JOELCLAW_SYSTEM_BUS_ENV:-${HOME}/.config/system-bus.env}"
+    [[ -f "$env_file" ]] || return 1
+
+    local value
+    value=$(awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$env_file")
+    value="${value%$'\r'}"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+    [[ -n "$value" ]] || return 1
+    printf '%s\n' "$value"
+}
+
 BASE_URL=$(resolve_base_url) || { error "All Anna's Archive mirrors unreachable. Run 'aa-book mirrors' to diagnose."; exit 1; }
 LOCAL_STAGING="/tmp/aa-book"
-NAS_HOST="joel@three-body"
-NAS_BOOKS_DIR="/volume1/home/joel/books"
+NAS_HOST="${JOELCLAW_NAS_HOST:-$(read_env_file_value JOELCLAW_NAS_HOST || true)}"
+NAS_BOOKS_DIR="${JOELCLAW_NAS_BOOKS_DIR:-$(read_env_file_value JOELCLAW_NAS_BOOKS_DIR || true)}"
 PROGRESS_LOG="/tmp/aa-book-progress.log"
 
 mkdir -p "$CONFIG_DIR" "$LOCAL_STAGING"
@@ -426,8 +442,26 @@ download_book() {
 }
 
 # --- Status ---
+check_nas_health() {
+    if [[ -z "$NAS_HOST" || -z "$NAS_BOOKS_DIR" ]]; then
+        error "NAS storage is not configured"
+        echo "Set JOELCLAW_NAS_HOST and JOELCLAW_NAS_BOOKS_DIR in the environment or ~/.config/system-bus.env"
+        return 1
+    fi
+
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "$NAS_HOST" \
+        "test -d '${NAS_BOOKS_DIR}' && test -w '${NAS_BOOKS_DIR}'" 2>/dev/null; then
+        echo "✅ NAS storage writable: ${NAS_HOST}:${NAS_BOOKS_DIR}"
+        return 0
+    fi
+
+    error "NAS storage unavailable or not writable: ${NAS_HOST}:${NAS_BOOKS_DIR}"
+    return 1
+}
+
 check_status() {
     local pid_file="${CONFIG_DIR}/current_job.pid"
+    local health_failed=0
 
     if [[ -f "$pid_file" ]]; then
         local pid=$(cat "$pid_file")
@@ -451,6 +485,9 @@ check_status() {
     local count=$(cat "${CONFIG_DIR}/download_count_${today}.txt" 2>/dev/null || echo 0)
     echo ""
     echo "📊 Downloads today: $count/25"
+    echo ""
+    check_nas_health || health_failed=1
+    return "$health_failed"
 }
 
 # --- Sync deferred transfers ---
@@ -461,8 +498,8 @@ sync_deferred() {
         return 0
     fi
 
-    # Check NAS reachability first
-    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$NAS_HOST" "echo ok" &>/dev/null; then
+    # Check the configured destination, not merely whether the host answers SSH.
+    if ! check_nas_health; then
         error "NAS still unreachable"
         echo "Pending transfers:"
         cat "$deferred_queue" | while IFS='|' read -r ts src dst; do
@@ -507,7 +544,7 @@ show_help() {
     echo "  download <md5> [dir] [--keep-local]"
     echo "                              Download → convert → optional SCP to NAS"
     echo "  sync                        Retry deferred NAS transfers"
-    echo "  status                      Check job & daily quota"
+    echo "  status                      Check job, daily quota & NAS storage"
     echo "  login                       Force browser re-login"
     echo ""
     echo "Examples:"
