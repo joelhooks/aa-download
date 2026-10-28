@@ -8,6 +8,7 @@ set -e
 COOKIE_FILE="${HOME}/.config/annas-archive/cookies.txt"
 SESSION_FILE="${HOME}/.config/annas-archive/aa-session.json"
 CONFIG_DIR="${HOME}/.config/annas-archive"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # Self-healing mirror discovery
 # Primary source: Wikipedia (AA's own recommendation for current domains)
 # Fallback: cached mirrors file + hardcoded seeds
@@ -406,39 +407,58 @@ download_book() {
         return 1
     fi
 
-    # Convert epub/mobi to pdf if Calibre available
-    if [[ "$extension" == "epub" || "$extension" == "mobi" ]] && command -v ebook-convert &> /dev/null; then
-        local pdf_path="${filepath%.*}.pdf"
-        status "Converting $extension to PDF..."
-        if timeout 120 ebook-convert "$filepath" "$pdf_path" --pdf-page-numbers 2>&1 | tail -3; then
-            [[ -f "$pdf_path" ]] && { rm "$filepath"; filepath="$pdf_path"; log "Converted to PDF"; }
+    # docs-brain ingests .pdf, .md and .txt. An epub becomes a Markdown sibling
+    # (stdlib, seconds, keeps chapter headings and printed page markers); the
+    # original stays as the archive copy. mobi/azw3 still need Calibre.
+    local ingest_path=""
+    if [[ "$extension" == "epub" ]]; then
+        local md_path="${filepath%.*}.md"
+        status "Converting epub to Markdown..."
+        if python3 -I "${SCRIPT_DIR}/epub2md" "$filepath" "$md_path"; then
+            ingest_path="$md_path"
         else
-            warn "Conversion failed, keeping original"
+            warn "epub2md failed; trying Calibre"
         fi
     fi
+    if [[ -z "$ingest_path" && "$extension" =~ ^(epub|mobi|azw3)$ ]] && command -v ebook-convert &> /dev/null; then
+        local pdf_path="${filepath%.*}.pdf"
+        status "Converting $extension to PDF with Calibre..."
+        local rc=0
+        timeout 180 ebook-convert "$filepath" "$pdf_path" --pdf-page-numbers > "${CONFIG_DIR}/convert.log" 2>&1 || rc=$?
+        if [[ $rc -eq 0 && -s "$pdf_path" ]]; then
+            ingest_path="$pdf_path"
+        elif [[ $rc -eq 124 ]]; then
+            warn "Calibre hung for 180s (seen as a stuck macOS syspolicyd check at dyld start); keeping $extension"
+        else
+            warn "Calibre failed (exit $rc, see ${CONFIG_DIR}/convert.log); keeping $extension"
+        fi
+    fi
+    [[ -z "$ingest_path" && "$extension" =~ ^(pdf|md|txt)$ ]] && ingest_path="$filepath"
+    [[ -n "$ingest_path" ]] && log "Ingest-ready: $ingest_path"
 
     if [[ "$keep_local" -eq 1 ]]; then
-        echo "$filepath"
+        echo "${ingest_path:-$filepath}"
         return 0
     fi
 
-    # Transfer to NAS (graceful — queue for retry if unreachable)
+    # Transfer to NAS (graceful — queue for retry if unreachable).
+    # scp -O: the NAS has no SFTP subsystem, so default scp gets "Connection closed".
     local year=$(date +%Y)
     local nas_dir="${NAS_BOOKS_DIR}/${year}"
     local deferred_queue="${CONFIG_DIR}/deferred-transfers.txt"
     status "Transferring to NAS: ${NAS_HOST}:${nas_dir}/"
     if ssh -o ConnectTimeout=5 -o BatchMode=yes "$NAS_HOST" "mkdir -p '${nas_dir}'" 2>/dev/null && \
-       scp -o ConnectTimeout=10 "$filepath" "${NAS_HOST}:${nas_dir}/$(basename "$filepath")" 2>/dev/null; then
+       scp -O -o ConnectTimeout=10 "$filepath" "${NAS_HOST}:${nas_dir}/$(basename "$filepath")" 2>/dev/null; then
         log "Stored on NAS: ${nas_dir}/$(basename "$filepath")"
-        # Clean local staging copy
-        rm -f "$filepath" 2>/dev/null
+        # The archive copy is on the NAS; the ingest-ready file stays local for joelclaw docs add.
+        [[ "$filepath" != "$ingest_path" ]] && rm -f "$filepath" 2>/dev/null
     else
         warn "NAS unreachable — file kept at $filepath"
         warn "Queued for deferred transfer"
         echo "$(date -Iseconds)|${filepath}|${nas_dir}/$(basename "$filepath")" >> "$deferred_queue"
     fi
 
-    echo "$filepath"
+    echo "${ingest_path:-$filepath}"
 }
 
 # --- Status ---
@@ -517,8 +537,9 @@ sync_deferred() {
         fi
         local nas_dir
         nas_dir="$(dirname "$dst")"
-        ssh -o ConnectTimeout=5 "$NAS_HOST" "mkdir -p '${NAS_BOOKS_DIR}/${nas_dir##*/books/}'" 2>/dev/null || true
-        if scp -o ConnectTimeout=10 "$src" "${NAS_HOST}:${NAS_BOOKS_DIR}/${nas_dir##*/books/}/$(basename "$dst")" 2>/dev/null; then
+        # dst is already the absolute NAS path recorded at queue time.
+        ssh -o ConnectTimeout=5 "$NAS_HOST" "mkdir -p '${nas_dir}'" 2>/dev/null || true
+        if scp -O -o ConnectTimeout=10 "$src" "${NAS_HOST}:${dst}" 2>/dev/null; then
             log "Synced: $(basename "$src")"
             rm -f "$src" 2>/dev/null
         else

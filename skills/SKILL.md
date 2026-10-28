@@ -45,7 +45,7 @@ Steps:
 1. Ensure browser login/session
 2. Resolve partner download URL
 3. Download file (retry)
-4. Convert epub/mobi to PDF if possible
+4. Make an ingest-ready file: epub → Markdown via `bin/epub2md` (stdlib, keeps chapter headings and `[pNNN]` printed-page markers); mobi/azw3 → PDF via Calibre; pdf as-is
 5. Copy to the configured NAS book root unless `--keep-local` is set
 
 **`--keep-local` semantics matter**: WITHOUT it, the local file is DELETED after a successful NAS transfer. If the book is headed for docs-brain ingest, you need the local file — see the standard flow below.
@@ -58,23 +58,21 @@ Shows current progress, daily count, and a bounded SSH writeability check for th
 
 ## Standard flow: grab a book for the docs brain
 
-Verified end-to-end 2026-07-13 (A Pattern Language, Metaphors We Live By):
+Verified end-to-end 2026-10-28 (This Is Personal, Brennan Dunn):
 
 ```bash
-# 1. Download, keeping the local copy
-aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming --keep-local
+# 1. Download. The original goes to the NAS; the ingest-ready file (.md or .pdf) stays local.
+#    The last line printed is that local path.
+aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming
 
-# 2. Archive to NAS yourself (aa-book skipped it because of --keep-local).
-# Read the same machine-local placement config that aa-book uses; do not hardcode a retired NAS.
-NAS_HOST=$(awk -F= '$1 == "JOELCLAW_NAS_HOST" {sub(/^[^=]*=/, ""); print; exit}' ~/.config/system-bus.env)
-NAS_BOOKS_DIR=$(awk -F= '$1 == "JOELCLAW_NAS_BOOKS_DIR" {sub(/^[^=]*=/, ""); print; exit}' ~/.config/system-bus.env)
-year=$(date +%Y)
-ssh -o BatchMode=yes "$NAS_HOST" "mkdir -p '$NAS_BOOKS_DIR/$year'"
-scp /Users/joel/clawd/data/pdf-brain/incoming/<file>.pdf "$NAS_HOST:$NAS_BOOKS_DIR/$year/"
+# 2. Queue docs-brain ingest with an ABSOLUTE path (a relative path fails in docs-ingest
+#    with "file not found at requested path or NAS fallbacks").
+joelclaw docs add /Users/joel/clawd/data/pdf-brain/incoming/<file>.md --title "<Proper Title (Author)>" --category <business|design|...>
 
-# 3. Queue docs-brain ingest (async Inngest pipeline; verify later with docs search)
-joelclaw docs add /Users/joel/clawd/data/pdf-brain/incoming/<file>.pdf --title "<Proper Title (Author)>"
+# 3. Verify: joelclaw event <event-id> shows the docs-ingest run; then joelclaw docs search "<phrase>"
 ```
+
+`--keep-local` skips the NAS step entirely (testing, or the NAS is down).
 
 ## Daily Limits
 
@@ -124,6 +122,8 @@ agent-browser eval "Array.from(document.querySelectorAll('a')).filter(a=>/fast p
 
 - **Anna's Archive format labels can lie** — A "pdf"-labeled md5 may be a zip/epub. Verify the `/md5/<hash>` page has a Fast Partner Server link before downloading; prefer passing an explicit verified md5.
 - **Libgen-slow-only md5s** — Some md5s fail with bare exit 1 on `aa-book download`. No retry; pick a different copy.
+- **Calibre can hang at launch** — 2026-10-28: `ebook-convert --version` sat at `_dyld_start` forever while macOS `syspolicyd` logged `Unable to initialize qtn_proc`. Removing the quarantine xattr didn't help; a `syspolicyd` restart needs sudo. epub no longer depends on Calibre. aa-book times Calibre out at 180 s and says so.
+- **The NAS has no SFTP subsystem** — plain `scp` gets `Connection closed`; use `scp -O` (aa-book does since 2026-10-28).
 - **azw3 conversion** — azw3 needs conversion to PDF before docs-ingest. aa-book's auto-convert historically only covered epub/mobi; a March-2026 azw3 of A Pattern Language sat on the NAS unconverted and never reached the docs brain — the gotcha is real. Verify before relying on it.
 - **Status codes lie about mirror health** — a parked domain answers 200 and a DDoS-Guard mirror answers 200 on `/` then 302s `/search` into a check page. The resolver now classifies mirrors by fetching `/search?q=test` and looking for md5 links (`ok`), a bot-check page (`shielded`), or squatter text (`parked`). It prefers `ok`, accepts `shielded` (download still works), never picks `parked`/`dead`, and caches the pick for an hour in `~/.config/annas-archive/active-mirror.txt`. `aa-book mirrors` forces a re-probe.
 - **NAS placement comes from machine config.** `JOELCLAW_NAS_HOST` and `JOELCLAW_NAS_BOOKS_DIR` may be exported directly or stored in `~/.config/system-bus.env`. `aa-book status` proves the configured directory exists and is writable before claiming storage health.

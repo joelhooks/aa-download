@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Convert an EPUB to Markdown in reading order, stdlib only.
+
+Used by aa-book when Calibre is missing or hangs. docs-brain ingest accepts .md,
+so this is the fallback that keeps epubs flowing.
+
+Usage: epub2md <book.epub> [out.md]
+"""
+import html
+import posixpath
+import re
+import sys
+import zipfile
+from html.parser import HTMLParser
+from xml.etree import ElementTree as ET
+
+BLOCK = {"p", "div", "section", "article", "blockquote", "li", "tr", "br", "hr",
+         "h1", "h2", "h3", "h4", "h5", "h6", "pre", "figure", "figcaption", "table"}
+SKIP = {"script", "style", "head", "title", "nav"}
+# Publishers often style headings as <p class="chaptitle"> instead of <h1>.
+CLASS_HEADINGS = [
+    (re.compile(r"part.?(title|num|head)", re.I), 1),
+    (re.compile(r"chap.?(title|num|head)|^(title|ct|cn)$", re.I), 2),
+    (re.compile(r"chap.?sub(?!w)|^(h|head|subhead|sub)[a-z]?$|sect.?(title|head)", re.I), 3),
+    (re.compile(r"chap.?subw|subsub|^h[b-d]$", re.I), 4),
+]
+
+
+def class_heading(attrs):
+    cls = dict(attrs).get("class") or ""
+    for name in cls.split():
+        for pattern, level in CLASS_HEADINGS:
+            if pattern.search(name):
+                return level
+    return 0
+
+
+class ToMarkdown(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []
+        self.skip = 0
+        self.prefix = ""
+        self.list_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in SKIP:
+            self.skip += 1
+            return
+        if tag in ("ul", "ol"):
+            self.list_depth += 1
+        if tag in BLOCK:
+            self.out.append("\n\n")
+        a = dict(attrs)
+        if a.get("epub:type") == "pagebreak" and a.get("title"):
+            # Printed page markers keep quotes citable to the page.
+            self.out.append(f" [p{a['title']}] ")
+            return
+        level = class_heading(attrs) if tag in ("p", "div") else 0
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.out.append("#" * int(tag[1]) + " ")
+        elif level:
+            self.out.append("#" * level + " ")
+        elif tag == "li":
+            self.out.append("  " * max(self.list_depth - 1, 0) + "- ")
+        elif tag == "blockquote":
+            self.out.append("> ")
+        elif tag in ("em", "i"):
+            self.out.append("*")
+        elif tag in ("strong", "b"):
+            self.out.append("**")
+
+    def handle_endtag(self, tag):
+        if tag in SKIP:
+            self.skip = max(self.skip - 1, 0)
+            return
+        if tag in ("ul", "ol"):
+            self.list_depth = max(self.list_depth - 1, 0)
+        if tag in ("em", "i"):
+            self.out.append("*")
+        elif tag in ("strong", "b"):
+            self.out.append("**")
+        if tag in BLOCK:
+            self.out.append("\n\n")
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        self.out.append(re.sub(r"\s+", " ", data))
+
+    def text(self):
+        s = "".join(self.out)
+        s = re.sub(r"[ \t]+\n", "\n", s)
+        s = re.sub(r"\n[ \t]+", "\n", s)
+        s = re.sub(r"\*\*\s*\*\*|\*\s*\*", "", s)
+        s = re.sub(r"^(#+) +\[p(\w+)\] *(.*)$", r"\1 \3 [p\2]", s, flags=re.M)
+        return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def ns_strip(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def spine_paths(z):
+    container = ET.fromstring(z.read("META-INF/container.xml"))
+    opf_path = next(e.get("full-path") for e in container.iter() if ns_strip(e.tag) == "rootfile")
+    opf = ET.fromstring(z.read(opf_path))
+    base = posixpath.dirname(opf_path)
+    manifest = {}
+    title = None
+    for e in opf.iter():
+        t = ns_strip(e.tag)
+        if t == "item":
+            manifest[e.get("id")] = e.get("href")
+        elif t == "title" and title is None and (e.text or "").strip():
+            title = e.text.strip()
+    hrefs = [manifest[e.get("idref")] for e in opf.iter()
+             if ns_strip(e.tag) == "itemref" and e.get("idref") in manifest]
+    paths = [posixpath.normpath(posixpath.join(base, html.unescape(h).split("#")[0])) for h in hrefs]
+    return title, paths
+
+
+def convert(epub, out):
+    with zipfile.ZipFile(epub) as z:
+        title, paths = spine_paths(z)
+        names = set(z.namelist())
+        parts = []
+        for p in paths:
+            if p not in names:
+                continue
+            parser = ToMarkdown()
+            parser.feed(z.read(p).decode("utf-8", errors="replace"))
+            chunk = parser.text()
+            if chunk:
+                parts.append(chunk)
+    body = "\n\n".join(parts)
+    if title and not body.lstrip().startswith("# "):
+        body = f"# {title}\n\n{body}"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(body + "\n")
+    return len(parts), len(body.split())
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit("usage: epub2md <book.epub> [out.md]")
+    src = sys.argv[1]
+    dst = sys.argv[2] if len(sys.argv) > 2 else re.sub(r"\.epub$", "", src, flags=re.I) + ".md"
+    sections, words = convert(src, dst)
+    if words < 1000:
+        sys.exit(f"epub2md: only {words} words from {sections} sections; refusing to call that a book")
+    print(f"{dst} ({sections} sections, {words} words)")
