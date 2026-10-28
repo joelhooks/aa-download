@@ -45,7 +45,7 @@ Steps:
 1. Ensure browser login/session
 2. Resolve partner download URL
 3. Download file (retry)
-4. Make an ingest-ready file: epub → Markdown via `bin/epub2md` (stdlib, keeps chapter headings and `[pNNN]` printed-page markers); mobi/azw3 → PDF via Calibre; pdf as-is
+4. Make ingest-ready files: epub → Markdown via `bin/epub2md` (stdlib, keeps chapter headings and `[pNNN]` printed-page markers) plus a PDF of the same text printed by headless Chrome; mobi/azw3 → PDF via Calibre; pdf as-is
 5. Copy to the configured NAS book root unless `--keep-local` is set
 
 **`--keep-local` semantics matter**: WITHOUT it, the local file is DELETED after a successful NAS transfer. If the book is headed for docs-brain ingest, you need the local file — see the standard flow below.
@@ -61,15 +61,19 @@ Shows current progress, daily count, and a bounded SSH writeability check for th
 Verified end-to-end 2026-10-28 (This Is Personal, Brennan Dunn):
 
 ```bash
-# 1. Download. The original goes to the NAS; the ingest-ready file (.md or .pdf) stays local.
-#    The last line printed is that local path.
+# 1. Download. The original goes to the NAS (with the .md sibling for epubs); the
+#    ingest-ready PDF and the .md stay local. The last line printed is the PDF path.
 aa-book download <md5> /Users/joel/clawd/data/pdf-brain/incoming
 
-# 2. Queue docs-brain ingest with an ABSOLUTE path (a relative path fails in docs-ingest
-#    with "file not found at requested path or NAS fallbacks").
-joelclaw docs add /Users/joel/clawd/data/pdf-brain/incoming/<file>.md --title "<Proper Title (Author)>" --category <business|design|...>
+# 2. Register it. Use an ABSOLUTE path: a relative one fails in docs-ingest with
+#    "file not found at requested path or NAS fallbacks".
+joelclaw docs add /Users/joel/clawd/data/pdf-brain/incoming/<file>.pdf --title "<Proper Title (Author)>" --category <business|design|...>
 
-# 3. Verify: joelclaw event <event-id> shows the docs-ingest run; then joelclaw docs search "<phrase>"
+# 3. Build the search index. docs add alone indexes 0 chunks (it reports chunksIndexed: 0;
+#    chunk indexing moved to reindex-v2), and reindex-v2 takes PDFs only.
+joelclaw docs reindex-v2 /Users/joel/clawd/data/pdf-brain/incoming/<file>.pdf --title "<Proper Title (Author)>"
+
+# 4. Verify: joelclaw event <event-id> shows COMPLETED with indexed > 0; then joelclaw docs search "<phrase>"
 ```
 
 `--keep-local` skips the NAS step entirely (testing, or the NAS is down).

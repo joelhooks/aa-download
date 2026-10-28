@@ -407,15 +407,32 @@ download_book() {
         return 1
     fi
 
-    # docs-brain ingests .pdf, .md and .txt. An epub becomes a Markdown sibling
-    # (stdlib, seconds, keeps chapter headings and printed page markers); the
-    # original stays as the archive copy. mobi/azw3 still need Calibre.
+    # docs add takes .pdf/.md/.txt, but docs reindex-v2 (the search index) takes
+    # PDFs only. An epub becomes a Markdown sibling (stdlib, keeps chapter headings
+    # and [pNNN] printed-page markers for citing) and a PDF of the same text
+    # printed by headless Chrome. The original stays as the archive copy.
+    # mobi/azw3 still need Calibre.
     local ingest_path=""
     if [[ "$extension" == "epub" ]]; then
         local md_path="${filepath%.*}.md"
+        local html_path
+        html_path="$(mktemp -d "${LOCAL_STAGING}/print.XXXX")/book.html"
         status "Converting epub to Markdown..."
-        if python3 -I "${SCRIPT_DIR}/epub2md" "$filepath" "$md_path"; then
+        if python3 -I "${SCRIPT_DIR}/epub2md" "$filepath" "$md_path" --html "$html_path"; then
             ingest_path="$md_path"
+            local chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            local pdf_path="${filepath%.*}.pdf"
+            if [[ -x "$chrome" ]]; then
+                status "Printing Markdown to PDF with headless Chrome..."
+                if timeout 180 "$chrome" --headless=new --disable-gpu --no-pdf-header-footer \
+                    --user-data-dir="$(dirname "$html_path")/profile" \
+                    --print-to-pdf="$pdf_path" "file://${html_path}" > "${CONFIG_DIR}/convert.log" 2>&1 \
+                    && [[ -s "$pdf_path" ]]; then
+                    ingest_path="$pdf_path"
+                else
+                    warn "Chrome PDF print failed (see ${CONFIG_DIR}/convert.log); Markdown is ingestable but not search-indexed"
+                fi
+            fi
         else
             warn "epub2md failed; trying Calibre"
         fi
@@ -450,8 +467,11 @@ download_book() {
     if ssh -o ConnectTimeout=5 -o BatchMode=yes "$NAS_HOST" "mkdir -p '${nas_dir}'" 2>/dev/null && \
        scp -O -o ConnectTimeout=10 "$filepath" "${NAS_HOST}:${nas_dir}/$(basename "$filepath")" 2>/dev/null; then
         log "Stored on NAS: ${nas_dir}/$(basename "$filepath")"
-        # The archive copy is on the NAS; the ingest-ready file stays local for joelclaw docs add.
+        # The archive copy is on the NAS; ingest files (.pdf and the .md sibling) stay local.
         [[ "$filepath" != "$ingest_path" ]] && rm -f "$filepath" 2>/dev/null
+        local md_sibling="${filepath%.*}.md"
+        [[ -f "$md_sibling" && "$md_sibling" != "$filepath" ]] && \
+            scp -O -o ConnectTimeout=10 "$md_sibling" "${NAS_HOST}:${nas_dir}/" 2>/dev/null || true
     else
         warn "NAS unreachable — file kept at $filepath"
         warn "Queued for deferred transfer"

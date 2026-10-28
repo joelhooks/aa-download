@@ -4,7 +4,10 @@
 Used by aa-book when Calibre is missing or hangs. docs-brain ingest accepts .md,
 so this is the fallback that keeps epubs flowing.
 
-Usage: epub2md <book.epub> [out.md]
+Usage: epub2md <book.epub> [out.md] [--html out.html]
+
+--html also writes a plain printable page of the same text. aa-book prints it to
+PDF with headless Chrome, because docs reindex-v2 (the search index) takes PDFs only.
 """
 import html
 import posixpath
@@ -141,12 +144,43 @@ def convert(epub, out):
     return len(parts), len(body.split())
 
 
+def md_to_html(md_path, out):
+    parts = ['<!doctype html><meta charset="utf-8"><style>'
+             'body{font:11pt Georgia,serif;margin:0 1in;line-height:1.4}'
+             'h1,h2{page-break-before:always}</style>']
+    with open(md_path, encoding="utf-8") as f:
+        blocks = f.read().split("\n\n")
+    for block in blocks:
+        b = block.strip()
+        if not b:
+            continue
+        m = re.match(r"^(#{1,6}) (.*)$", b)
+        if m:
+            n = len(m.group(1))
+            parts.append(f"<h{n}>{html.escape(m.group(2))}</h{n}>")
+            continue
+        t = html.escape(b)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
+        parts.append("<p>" + t.replace("\n", "<br>") + "</p>")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.exit("usage: epub2md <book.epub> [out.md]")
-    src = sys.argv[1]
-    dst = sys.argv[2] if len(sys.argv) > 2 else re.sub(r"\.epub$", "", src, flags=re.I) + ".md"
+    args = sys.argv[1:]
+    html_out = None
+    if "--html" in args:
+        i = args.index("--html")
+        html_out = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    if not args:
+        sys.exit("usage: epub2md <book.epub> [out.md] [--html out.html]")
+    src = args[0]
+    dst = args[1] if len(args) > 1 else re.sub(r"\.epub$", "", src, flags=re.I) + ".md"
     sections, words = convert(src, dst)
     if words < 1000:
         sys.exit(f"epub2md: only {words} words from {sections} sections; refusing to call that a book")
+    if html_out:
+        md_to_html(dst, html_out)
     print(f"{dst} ({sections} sections, {words} words)")
