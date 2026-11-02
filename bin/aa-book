@@ -393,7 +393,7 @@ download_book() {
     # Derive filename
     local decoded_filename=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1].split('/')[-1]))" "$download_url")
     local extension
-    extension=$(safe_extension "$decoded_filename") || { error "Refusing download: unexpected file type in partner URL (${decoded_filename:0:80})"; return 1; }
+    extension=$(safe_extension "$decoded_filename") || { error "Refusing download: unexpected file type in partner URL ($(printf '%s' "${decoded_filename:0:80}" | tr -d '[:cntrl:]'))"; return 1; }
     local slug=$(echo "$decoded_filename" | sed 's/ -- .*//; s/[^a-zA-Z0-9 ]//g; s/  */ /g' | cut -c1-80 | sed 's/ /-/g' | tr '[:upper:]' '[:lower:]')
     local filename="${slug}.${extension}"
     local filepath="${output_dir}/${filename}"
