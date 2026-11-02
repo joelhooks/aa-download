@@ -9,6 +9,17 @@ COOKIE_FILE="${HOME}/.config/annas-archive/cookies.txt"
 SESSION_FILE="${HOME}/.config/annas-archive/aa-session.json"
 CONFIG_DIR="${HOME}/.config/annas-archive"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# The extension comes from a partner server's URL and ends up in curl -o, the deferred queue and
+# `scp -O` remote paths, which the NAS's shell parses. Only known book types pass, lowercased; anything
+# else (shell metacharacters, an encoded slash, no dot at all) refuses the download. (Bastion, 2026-11-02)
+safe_extension() {
+    local name="$1" ext
+    [[ "$name" == *.* ]] || return 1
+    ext=$(printf '%s' "${name##*.}" | tr '[:upper:]' '[:lower:]')
+    [[ "$ext" =~ ^(pdf|epub|mobi|azw3|azw|djvu|fb2|txt|md|rtf|doc|docx|lit|cbz|cbr)$ ]] || return 1
+    printf '%s\n' "$ext"
+}
 # Self-healing mirror discovery
 # Primary source: Wikipedia (AA's own recommendation for current domains)
 # Fallback: cached mirrors file + hardcoded seeds
@@ -381,7 +392,8 @@ download_book() {
 
     # Derive filename
     local decoded_filename=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1].split('/')[-1]))" "$download_url")
-    local extension="${decoded_filename##*.}"
+    local extension
+    extension=$(safe_extension "$decoded_filename") || { error "Refusing download: unexpected file type in partner URL (${decoded_filename:0:80})"; return 1; }
     local slug=$(echo "$decoded_filename" | sed 's/ -- .*//; s/[^a-zA-Z0-9 ]//g; s/  */ /g' | cut -c1-80 | sed 's/ /-/g' | tr '[:upper:]' '[:lower:]')
     local filename="${slug}.${extension}"
     local filepath="${output_dir}/${filename}"
